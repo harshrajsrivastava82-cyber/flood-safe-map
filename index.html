@@ -214,13 +214,14 @@
             z-index: 15;
             background: #ea4335;
             color: white;
-            padding: 8px 16px;
+            padding: 12px 16px;
             border-radius: 8px;
             font-weight: 500;
             font-size: 13px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.2);
             display: none;
             transition: left 0.3s ease-in-out;
+            line-height: 1.4;
         }
 
         /* Map Container */
@@ -297,6 +298,14 @@
             },
             center: [79.45, 30.45],
             zoom: 10
+        });
+
+        map.on('click', async function(e) {
+            let clickedLat = e.lngLat.lat;
+            let clickedLon = e.lngLat.lng;
+
+            // Call your ML model backend API for this clicked point
+            let hazardData = await checkLocationHazard(clickedLat, clickedLon);
         });
 
         map.addControl(new maplibregl.NavigationControl(), 'top-right');
@@ -597,6 +606,8 @@
                     if (map.getLayer(`route-line-${i}`)) map.removeLayer(`route-line-${i}`);
                     if (map.getSource(`route-line-${i}`)) map.removeSource(`route-line-${i}`);
                 }
+                if (map.getLayer('evac-route')) map.removeLayer('evac-route');
+                if (map.getSource('evac-route')) map.removeSource('evac-route');
 
                 let hitHazard = null;
                 for (let coord of coords) {
@@ -691,6 +702,111 @@
                     'line-opacity': 0.9
                 }
             });
+        }
+
+        async function checkLocationHazard(lat, lon) {
+            try {
+                let response = await fetch(`http://localhost:5000/api/assess-hazard?lat=${lat}&lon=${lon}`);
+                let data = await response.json();
+
+                console.log("ML Hazard Assessment Received:", data);
+
+                if (data.status === "HIGH") {
+                    triggerRedZoneWarning(
+                        data.risk_percent, 
+                        data.slope_deg, 
+                        data.rainfall_mm, 
+                        data.normal_rainfall_mm, 
+                        data.water_depth_cm, 
+                        data.normal_water_depth_cm, 
+                        data.lat, 
+                        data.lon
+                    );
+                }
+                return data;
+            } catch (error) {
+                console.error("Error connecting to local ML model server:", error);
+            }
+        }
+
+        function triggerRedZoneWarning(riskPercent, slopeDeg, rain, normalRain, depth, normalDepth, lat, lon) {
+            const banner = document.getElementById('live-alert-banner');
+            banner.innerHTML = `
+                🚨 <b>HIGH HAZARD</b> <span style="font-size:11px; opacity:0.9;">(${lat.toFixed(3)}, ${lon.toFixed(3)})</span><br>
+                Risk: <b>${riskPercent}%</b> | Slope: <b>${slopeDeg}°</b><br>
+                🌧️ Rain: <b>${rain}mm</b> <span style="font-size:11px;">(Normal: ${normalRain}mm)</span> | 🌊 Depth: <b>${depth}cm</b> <span style="font-size:11px;">(Normal: ${normalDepth}cm)</span><br>
+                <button onclick="findEvacuationRoute(${lat}, ${lon})" style="margin-top: 10px; background: white; color: #ea4335; border: none; padding: 8px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; box-shadow: 0 2px 4px rgba(0,0,0,0.2);">🚗 Find Evacuation Route</button>
+            `;
+            banner.style.display = 'block';
+            
+            // Auto-hide the warning banner after 15 seconds
+            setTimeout(() => {
+                banner.style.display = 'none';
+            }, 15000);
+        }
+
+        async function findEvacuationRoute(startLat, startLon) {
+            const resultsContainer = document.getElementById('routes-results-container');
+            const banner = document.getElementById('live-alert-banner');
+            
+            banner.style.display = 'none';
+            const sidebar = document.getElementById('sidebar');
+            if (sidebar.classList.contains('collapsed')) toggleSidebar();
+
+            resultsContainer.innerHTML = '<p style="text-align:center; color:#1a73e8;">Calculating fastest evacuation route to safety...</p>';
+
+            const safeDest = { name: "Gauchar Relief Camp (Safe Zone)", coords: [79.1492, 30.2937] };
+
+            try {
+                const url = `https://router.project-osrm.org/route/v1/driving/${startLon},${startLat};${safeDest.coords[0]},${safeDest.coords[1]}?overview=full&geometries=geojson`;
+                const res = await fetch(url);
+                const data = await res.json();
+
+                if (!data || !data.routes || data.routes.length === 0) throw new Error('No routes found.');
+                const route = data.routes[0];
+                const coords = route.geometry.coordinates;
+
+                for (let i = 0; i < 20; i++) {
+                    if (map.getLayer(`route-line-${i}`)) map.removeLayer(`route-line-${i}`);
+                    if (map.getSource(`route-line-${i}`)) map.removeSource(`route-line-${i}`);
+                }
+                if (map.getLayer('evac-route')) map.removeLayer('evac-route');
+                if (map.getSource('evac-route')) map.removeSource('evac-route');
+
+                map.addSource('evac-route', {
+                    type: 'geojson',
+                    data: { type: 'Feature', geometry: { type: 'LineString', coordinates: coords } }
+                });
+                map.addLayer({
+                    id: 'evac-route',
+                    type: 'line',
+                    source: 'evac-route',
+                    layout: { 'line-join': 'round', 'line-cap': 'round' },
+                    paint: { 'line-color': '#1a73e8', 'line-width': 8, 'line-opacity': 0.9 }
+                });
+
+                const durationMins = Math.round(route.duration / 60);
+                const distanceKm = (route.distance / 1000).toFixed(1);
+
+                resultsContainer.innerHTML = `
+                    <div class="route-option-card safe" style="border-left: 5px solid #1a73e8; background: #e8f0fe;">
+                        <div style="display: flex; justify-content: space-between;">
+                            <strong style="font-size: 15px; color: #202124;">Emergency Evacuation</strong>
+                            <span style="font-size: 16px; font-weight: bold; color: #1a73e8;">${durationMins} min</span>
+                        </div>
+                        <div style="font-size: 13px; color: #5f6368; margin-top: 4px;">
+                            ${distanceKm} km • Head to: <b>${safeDest.name}</b>
+                        </div>
+                    </div>
+                `;
+
+                const bounds = coords.reduce((b, coord) => b.extend(coord), new maplibregl.LngLatBounds(coords[0], coords[0]));
+                map.fitBounds(bounds, { padding: 60 });
+
+            } catch (err) {
+                console.error(err);
+                resultsContainer.innerHTML = '<p style="color:red; font-size:13px;">Error calculating evacuation route.</p>';
+            }
         }
     </script>
 </body>
